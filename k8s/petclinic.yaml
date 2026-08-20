@@ -1,0 +1,42 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: spring-petclinic
+  namespace: petclinic
+  labels:
+    app: spring-petclinic
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: spring-petclinic
+  template:
+    metadata:
+      labels:
+        app: spring-petclinic
+    spec:
+      containers:
+      - name: petclinic
+        image: ghcr.io/sandovalcp/spring-petclinic-otel:1.0
+        ports:
+        - containerPort: 8080
+        env:
+        - name: OTEL_SERVICE_NAME
+          value: "spring-petclinic"
+        # ESTA PROPRIEDADE FAZ O JAVA IGNORAR O VALOR ANTIGO DA IMAGEM:
+        - name: JAVA_TOOL_OPTIONS
+          value: "-Dotel.exporter.otlp.endpoint=http://alloy.monitoring-lab.svc.cluster.local:4318"
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: petclinic
+  namespace: petclinic
+spec:
+  selector:
+    app: spring-petclinic
+  ports:
+    - protocol: TCP
+      port: 80
+      targetPort: 8080
+  type: ClusterIP

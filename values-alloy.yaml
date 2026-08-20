@@ -1,0 +1,29 @@
+alloy:
+  stabilityLevel: "experimental"
+  configMap:
+    content: |
+      otelcol.receiver.otlp "default" {
+        grpc {
+          endpoint = "0.0.0.0:4317"
+        }
+        http {
+          endpoint = "0.0.0.0:4318"
+        }
+        output {
+          metrics = [otelcol.exporter.debug.default.input]
+          logs    = [otelcol.exporter.debug.default.input]
+          traces  = [otelcol.exporter.debug.default.input]
+        }
+      }
+      otelcol.exporter.debug "default" {
+        verbosity = "normal"
+      }
+  extraPorts:
+    - name: otlp-grpc
+      port: 4317
+      targetPort: 4317
+      protocol: TCP
+    - name: otlp-http
+      port: 4318
+      targetPort: 4318
+      protocol: TCP

@@ -1,0 +1,10 @@
+spec:
+  template:
+    spec:
+      containers:
+      - name: petclinic
+        env:
+        - name: OTEL_SERVICE_NAME
+          value: spring-petclinic
+        - name: OTEL_EXPORTER_OTLP_ENDPOINT
+          value: http://cluster.local
