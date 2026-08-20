@@ -1,0 +1,291 @@
+# =========================================================================
+# CONTROLLER: define como o pod do Alloy roda no cluster
+# =========================================================================
+controller:
+  type: 'daemonset'
+
+  volumes:
+    extra:
+      - name: rootfs
+        hostPath:
+          path: /
+      - name: procfs
+        hostPath:
+          path: /proc
+      - name: sysfs
+        hostPath:
+          path: /sys
+
+
+# =========================================================================
+# SERVICE: expõe as portas OTLP do Alloy para o cluster (gRPC e HTTP)
+# =========================================================================
+service:
+  enabled: true
+  type: ClusterIP
+  extraPorts:
+    - name: otlp-grpc
+      port: 4317
+      targetPort: 4317
+      protocol: TCP
+    - name: otlp-http
+      port: 4318
+      targetPort: 4318
+      protocol: TCP
+
+
+# =========================================================================
+# RBAC: permissões necessárias para o discovery.kubernetes (role=node)
+# =========================================================================
+rbac:
+  create: true
+
+
+# =========================================================================
+# ALLOY: config do container em si
+# =========================================================================
+alloy:
+  extraEnv:
+    - name: NODE_NAME
+      valueFrom:
+        fieldRef:
+          fieldPath: spec.nodeName
+
+  extraPorts:
+    - name: otlp-grpc
+      port: 4317
+      targetPort: 4317
+      protocol: TCP
+    - name: otlp-http
+      port: 4318
+      targetPort: 4318
+      protocol: TCP
+
+  mounts:
+    extra:
+      - name: rootfs
+        mountPath: /host/root
+        readOnly: true
+      - name: procfs
+        mountPath: /host/proc
+        readOnly: true
+      - name: sysfs
+        mountPath: /host/sys
+        readOnly: true
+
+  configMap:
+    create: true
+    content: |-
+      // =====================================================================
+      // PIPELINE 1: recebe telemetria OTLP de apps/Beyla
+      // =====================================================================
+
+      otelcol.receiver.otlp "default" {
+        grpc { }
+        http { }
+        output {
+          metrics = [otelcol.processor.batch.default.input]
+          logs    = [otelcol.processor.filter.filter_beyla.input]
+          traces  = [otelcol.processor.batch.default.input]
+        }
+      }
+
+      otelcol.processor.filter "filter_beyla" {
+        error_mode = "ignore"
+        logs {
+          log_record = [
+            "IsMatch(body.string, \".*(ec2imds|otelNodeFetcher|MetadataProvider).*\")",
+          ]
+        }
+        output {
+          logs = [otelcol.processor.batch.default.input]
+        }
+      }
+
+      otelcol.processor.batch "default" {
+        output {
+          metrics = [otelcol.exporter.prometheus.default.input]
+          logs    = [otelcol.exporter.loki.default.input]
+          traces  = [otelcol.exporter.otlp.tempo.input]
+        }
+      }
+
+      otelcol.exporter.prometheus "default" {
+        forward_to = [prometheus.remote_write.prometheus.receiver]
+      }
+
+      otelcol.exporter.loki "default" {
+        forward_to = [loki.write.loki.receiver]
+      }
+
+      otelcol.exporter.otlp "tempo" {
+        client {
+          endpoint = "tempo.monitoring-lab.svc.cluster.local:4317"
+          tls { insecure = true }
+        }
+      }
+
+
+      // =====================================================================
+      // PIPELINE 2: métricas de CPU, memória, rede e disco do NÓ
+      // =====================================================================
+
+      prometheus.exporter.unix "host" {
+        rootfs_path = "/host/root"
+        procfs_path = "/host/proc"
+        sysfs_path  = "/host/sys"
+        disable_collectors = ["mdadm", "ipvs", "btrfs"]
+      }
+
+      discovery.relabel "host" {
+        targets = prometheus.exporter.unix.host.targets
+        rule {
+          target_label = "instance"
+          replacement  = sys.env("NODE_NAME")
+        }
+        rule {
+          target_label = "job"
+          replacement  = "integrations/node_exporter"
+        }
+      }
+
+      prometheus.scrape "host" {
+        targets         = discovery.relabel.host.output
+        job_name        = "integrations/node_exporter"
+        scrape_interval = "30s"
+        forward_to      = [prometheus.remote_write.prometheus.receiver]
+      }
+
+
+      // =====================================================================
+      // PIPELINE 3: métricas de CPU, memória, rede e disco por container
+      // =====================================================================
+
+      discovery.kubernetes "nodes" {
+        role = "node"
+      }
+
+      discovery.relabel "cadvisor" {
+        targets = discovery.kubernetes.nodes.targets
+        rule {
+          replacement  = "/metrics/cadvisor"
+          target_label = "__metrics_path__"
+        }
+      }
+
+      prometheus.scrape "cadvisor" {
+        job_name = "integrations/kubernetes/cadvisor"
+        targets  = discovery.relabel.cadvisor.output
+
+        scheme            = "https"
+        bearer_token_file = "/var/run/secrets/kubernetes.io/serviceaccount/token"
+        tls_config {
+          insecure_skip_verify = true
+        }
+
+        scrape_interval = "30s"
+        forward_to      = [prometheus.remote_write.prometheus.receiver]
+      }
+
+
+      // =====================================================================
+      // PIPELINE 4: métricas customizadas da app "sna"
+      // =====================================================================
+
+      discovery.kubernetes "sna_pods" {
+        role = "pod"
+        namespaces {
+          own_namespace = false
+          names         = ["sna-lab-rr"]
+        }
+      }
+
+      discovery.relabel "sna_scrape" {
+        targets = discovery.kubernetes.sna_pods.targets
+
+        rule {
+          source_labels = ["__meta_kubernetes_pod_label_app"]
+          regex         = "sna"
+          action        = "keep"
+        }
+
+        rule {
+          source_labels = ["__address__"]
+          regex         = "(.+):\\d+"
+          replacement   = "${1}:8099"
+          target_label  = "__address__"
+        }
+      }
+
+      prometheus.scrape "sna" {
+        targets      = discovery.relabel.sna_scrape.output
+        job_name     = "sna-lab-rr/sna"
+        metrics_path = "/metrics"
+
+        scrape_interval = "30s"
+        forward_to      = [prometheus.remote_write.prometheus.receiver]
+      }
+
+
+      // =====================================================================
+      // PIPELINE 5: Coleta automática de logs de pods via loki.source.kubernetes
+      // =====================================================================
+
+      discovery.kubernetes "pod_logs" {
+        role = "pod"
+      }
+
+      discovery.relabel "pod_logs" {
+        targets = discovery.kubernetes.pod_logs.targets
+
+        rule {
+          source_labels = ["__meta_kubernetes_namespace"]
+          regex         = "sna-lab-rr"
+          action        = "keep"
+        }
+
+        rule {
+          source_labels = ["__meta_kubernetes_pod_label_app"]
+          regex         = "sna"
+          action        = "keep"
+        }
+
+        rule {
+          source_labels = ["__meta_kubernetes_namespace"]
+          target_label  = "namespace"
+        }
+        rule {
+          source_labels = ["__meta_kubernetes_pod_name"]
+          target_label  = "pod"
+        }
+        rule {
+          source_labels = ["__meta_kubernetes_pod_container_name"]
+          target_label  = "container"
+        }
+        rule {
+          source_labels = ["__meta_kubernetes_pod_label_app"]
+          target_label  = "app"
+        }
+      }
+
+      loki.source.kubernetes "pod_logs" {
+        targets    = discovery.relabel.pod_logs.output
+        forward_to = [loki.write.loki.receiver]
+      }
+
+
+      // =====================================================================
+      // DESTINOS
+      // =====================================================================
+
+      prometheus.remote_write "prometheus" {
+        endpoint {
+          url = "http://prometheus.monitoring-lab.svc.cluster.local:9090/prometheus/api/v1/write"
+        }
+      }
+
+      loki.write "loki" {
+        endpoint {
+          url = "http://loki.monitoring-lab.svc.cluster.local:3100/loki/api/v1/push"
+        }
+      }
